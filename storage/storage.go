@@ -36,52 +36,53 @@ func NewStorage(dbPath string) (*Storage, error) {
 	}
 
 	schema := `
-    CREATE TABLE IF NOT EXISTS content (
-        id TEXT PRIMARY KEY, 
-        user_id TEXT NOT NULL, 
-        content BLOB NOT NULL,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-    CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        username TEXT UNIQUE NOT NULL,
-        is_active BOOLEAN DEFAULT 1,   
-        is_approved BOOLEAN DEFAULT 0,
-        role TEXT DEFAULT 'user',      
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS public_keys (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        authorized_key TEXT NOT NULL, 
-        fingerprint TEXT,              
-        added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-    CREATE TABLE IF NOT EXISTS access_requests (
-        id TEXT PRIMARY KEY,
-        username TEXT UNIQUE NOT NULL,
-        public_key TEXT NOT NULL,
-        message TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-    CREATE INDEX IF NOT EXISTS idx_public_keys_user_id ON public_keys(user_id);
-    `
+	CREATE TABLE IF NOT EXISTS content (
+		id TEXT PRIMARY KEY, 
+		user_id TEXT NOT NULL, 
+		content BLOB NOT NULL,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+	);
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		username TEXT UNIQUE NOT NULL,
+		is_active BOOLEAN DEFAULT 1,   
+		is_approved BOOLEAN DEFAULT 1, 
+		role TEXT DEFAULT 'user',      
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS public_keys (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		authorized_key TEXT NOT NULL, 
+		fingerprint TEXT,              
+		added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+	);
+	CREATE TABLE IF NOT EXISTS access_requests (
+		id TEXT PRIMARY KEY,
+		username TEXT UNIQUE NOT NULL,
+		public_key TEXT NOT NULL,
+		message TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+	CREATE INDEX IF NOT EXISTS idx_public_keys_user_id ON public_keys(user_id);
+	`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to create schema: %w", err)
 	}
 
+	db.Exec("UPDATE users SET is_active = 0")
 	return &Storage{db: db}, nil
 }
 
 func (s *Storage) ValidatePublicKey(username string, incomingKey ssh.PublicKey) bool {
 	query := `
-        SELECT pk.authorized_key, CAST(u.is_active AS TEXT), CAST(u.is_approved AS TEXT)
-        FROM public_keys pk
-        JOIN users u ON u.id = pk.user_id
-        WHERE u.username = ?;
-    `
+		SELECT pk.authorized_key, CAST(u.is_active AS TEXT), CAST(u.is_approved AS TEXT)
+		FROM public_keys pk
+		JOIN users u ON u.id = pk.user_id
+		WHERE u.username = ?;
+	`
 	rows, err := s.db.Query(query, username)
 	if err != nil {
 		log.Error("Database query failed", "err", err)
@@ -111,43 +112,36 @@ func (s *Storage) ValidatePublicKey(username string, incomingKey ssh.PublicKey) 
 	return false
 }
 
-func (s *Storage) AddUser(username, authorizedKey string) error {
-	_, _, _, _, err := ssh.ParseAuthorizedKey([]byte(authorizedKey))
+func (s *Storage) GetAccessRequests() ([][]string, error) {
+	query := `SELECT id, username, public_key, COALESCE(message, ''), created_at FROM access_requests ORDER BY created_at DESC`
+	rows, err := s.db.Query(query)
 	if err != nil {
-		return fmt.Errorf("invalid SSH public key: %w", err)
+		return nil, err
 	}
+	defer rows.Close()
 
-	userID, _ := GenerateUUIDv4()
-	keyID, _ := GenerateUUIDv4()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+	var requests [][]string
+	for rows.Next() {
+		var id, username, pubKey, message, createdAt string
+		if err := rows.Scan(&id, &username, &pubKey, &message, &createdAt); err != nil {
+			log.Error("Failed to scan access request row", "err", err)
+			continue
+		}
+		requests = append(requests, []string{id, username, pubKey, message, createdAt})
 	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec(`INSERT INTO users (id, username, is_active) VALUES (?, ?, 1)`, userID, username); err != nil {
-		return fmt.Errorf("failed to insert user: %w", err)
-	}
-
-	if _, err := tx.Exec(`INSERT INTO public_keys (id, user_id, authorized_key) VALUES (?, ?, ?)`, keyID, userID, authorizedKey); err != nil {
-		return fmt.Errorf("failed to insert public key: %w", err)
-	}
-
-	return tx.Commit()
+	return requests, nil
 }
 
 func (s *Storage) GetAllUsers() ([][]string, error) {
 	query := `
-        SELECT 
-            u.username, 
-            CAST(u.is_active AS TEXT), 
-            CAST(u.is_approved AS TEXT), 
-            COALESCE(u.role, 'user'),
-            CASE WHEN a.id IS NOT NULL THEN 'Yes' ELSE 'No' END as pending_device
-        FROM users u
-        LEFT JOIN access_requests a ON u.username = a.username
-    `
+		SELECT 
+			username, 
+			CAST(is_active AS TEXT), 
+			CAST(is_approved AS TEXT),
+			COALESCE(role, 'user')
+		FROM users
+		ORDER BY username ASC
+	`
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
@@ -156,24 +150,22 @@ func (s *Storage) GetAllUsers() ([][]string, error) {
 
 	var users [][]string
 	for rows.Next() {
-		var name, active, approved, role, pending string
-
-		if err := rows.Scan(&name, &active, &approved, &role, &pending); err != nil {
-			log.Error("Failed to scan user row", "err", err)
+		var name, active, approved, role string
+		if err := rows.Scan(&name, &active, &approved, &role); err != nil {
 			continue
 		}
 
-		isActive := "false"
+		isOnline := "No"
 		if active == "1" || active == "true" {
-			isActive = "true"
+			isOnline = "Yes"
 		}
 
-		isApproved := "false"
+		isApproved := "Revoked"
 		if approved == "1" || approved == "true" {
-			isApproved = "true"
+			isApproved = "Approved"
 		}
 
-		users = append(users, []string{name, isActive, isApproved, role, pending})
+		users = append(users, []string{name, isOnline, isApproved, role})
 	}
 	return users, nil
 }
@@ -184,25 +176,11 @@ func (s *Storage) ToggleApproval(username string) error {
 }
 
 func (s *Storage) SubmitRequest(username, pubKey, message string) error {
-	var userID string
-
-	// The fixed unique variable to prevent shadowing errors
-	lookupErr := s.db.QueryRow(`SELECT id FROM users WHERE username = ?`, username).Scan(&userID)
-
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
-
-	if lookupErr == sql.ErrNoRows {
-		userID, _ = GenerateUUIDv4()
-		if _, err = tx.Exec(`INSERT INTO users (id, username, is_active) VALUES (?, ?, 1)`, userID, username); err != nil {
-			return fmt.Errorf("failed to insert new user: %w", err)
-		}
-	} else if lookupErr != nil {
-		return fmt.Errorf("database error checking user: %w", lookupErr)
-	}
 
 	if _, err = tx.Exec(`DELETE FROM access_requests WHERE username = ?`, username); err != nil {
 		return fmt.Errorf("failed to clear old requests: %w", err)
@@ -216,24 +194,38 @@ func (s *Storage) SubmitRequest(username, pubKey, message string) error {
 	return tx.Commit()
 }
 
-func (s *Storage) ApproveNewDevice(username string) error {
-	var userID string
-	if err := s.db.QueryRow(`SELECT id FROM users WHERE username = ?`, username).Scan(&userID); err != nil {
-		return fmt.Errorf("user not found")
-	}
-
+func (s *Storage) ApproveRequest(username string) error {
 	var pubKey string
 	if err := s.db.QueryRow(`SELECT public_key FROM access_requests WHERE username = ?`, username).Scan(&pubKey); err != nil {
-		return fmt.Errorf("no pending device requests for this user")
+		return fmt.Errorf("request not found: %w", err)
 	}
 
-	tx, _ := s.db.Begin()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
 	defer tx.Rollback()
 
+	var userID string
+	err = tx.QueryRow(`SELECT id FROM users WHERE username = ?`, username).Scan(&userID)
+
+	if err == sql.ErrNoRows {
+		userID, _ = GenerateUUIDv4()
+		if _, err := tx.Exec(`INSERT INTO users (id, username, is_active, is_approved) VALUES (?, ?, 1, 1)`, userID, username); err != nil {
+			return fmt.Errorf("failed to insert user: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("database error checking user: %w", err)
+	}
+
 	keyID, _ := GenerateUUIDv4()
-	tx.Exec(`INSERT INTO public_keys (id, user_id, authorized_key) VALUES (?, ?, ?)`, keyID, userID, pubKey)
-	tx.Exec(`DELETE FROM access_requests WHERE username = ?`, username)
-	tx.Exec(`UPDATE users SET is_approved = 1 WHERE username = ?`, username)
+	if _, err := tx.Exec(`INSERT INTO public_keys (id, user_id, authorized_key) VALUES (?, ?, ?)`, keyID, userID, pubKey); err != nil {
+		return fmt.Errorf("failed to insert public key: %w", err)
+	}
+
+	if _, err := tx.Exec(`DELETE FROM access_requests WHERE username = ?`, username); err != nil {
+		return fmt.Errorf("failed to delete access request: %w", err)
+	}
 
 	return tx.Commit()
 }
@@ -268,4 +260,13 @@ func (s *Storage) IsAdmin(username string) bool {
 		return false
 	}
 	return role == "admin"
+}
+
+func (s *Storage) SetOnlineStatus(username string, isOnline bool) error {
+	status := 0
+	if isOnline {
+		status = 1
+	}
+	_, err := s.db.Exec(`UPDATE users SET is_active = ? WHERE username = ?`, status, username)
+	return err
 }

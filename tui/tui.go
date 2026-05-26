@@ -16,6 +16,9 @@ var (
 	baseStyle    = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).Padding(0, 1)
 	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+
+	blurredStyle = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
+	focusedStyle = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("62")).Padding(0, 1)
 )
 
 type tickMsg time.Time
@@ -35,9 +38,9 @@ type tuiModel struct {
 	table           table.Model
 	inputs          []textinput.Model
 	focus           int
+	focusPane       int // 0 = Admin Table, 1 = App View
 	message         string
 	err             error
-	rawUsers        [][]string
 }
 
 func InitialModel(db *storage.Storage, isAdmin bool, isAuthenticated bool, pubKey ssh.PublicKey, username string) *tuiModel {
@@ -47,20 +50,23 @@ func InitialModel(db *storage.Storage, isAdmin bool, isAuthenticated bool, pubKe
 		isAuthenticated: isAuthenticated,
 		username:        username,
 		publicKey:       pubKey,
+		focusPane:       0,
 	}
 
 	if isAdmin {
 		columns := []table.Column{
 			{Title: "Username", Width: 15},
-			{Title: "Active", Width: 8},
-			{Title: "Approved", Width: 10},
+			{Title: "Online", Width: 8},
+			{Title: "Status", Width: 12},
 			{Title: "Role", Width: 8},
+			{Title: "Message", Width: 30},
+			{Title: "Date", Width: 12},
 		}
 
 		t := table.New(
 			table.WithColumns(columns),
 			table.WithFocused(true),
-			table.WithHeight(10),
+			table.WithHeight(8),
 		)
 		s := table.DefaultStyles()
 		s.Header = s.Header.BorderStyle(lipgloss.NormalBorder()).BorderBottom(true).Bold(true)
@@ -90,16 +96,35 @@ func InitialModel(db *storage.Storage, isAdmin bool, isAuthenticated bool, pubKe
 }
 
 func (m *tuiModel) refreshTable() {
-	users, err := m.db.GetAllUsers()
-	if err != nil {
-		return
+	var rows []table.Row
+
+	requests, err := m.db.GetAccessRequests()
+	if err == nil {
+		for _, r := range requests {
+			username := r[1]
+			message := r[3]
+			createdAt := r[4]
+
+			if len(createdAt) > 10 {
+				createdAt = createdAt[:10]
+			}
+
+			rows = append(rows, table.Row{username, "-", "* Pending", "-", message, createdAt})
+		}
 	}
 
-	m.rawUsers = users
-	var rows []table.Row
-	for _, u := range users {
-		rows = append(rows, table.Row{u[0], u[1], u[2], u[3]})
+	users, err := m.db.GetAllUsers()
+	if err == nil {
+		for _, u := range users {
+			username := u[0]
+			isOnline := u[1]
+			status := u[2]
+			role := u[3]
+
+			rows = append(rows, table.Row{username, isOnline, status, role, "", ""})
+		}
 	}
+
 	m.table.SetRows(rows)
 }
 
@@ -137,40 +162,47 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.isAdmin {
-			switch msg.String() {
-			case "A", "a":
-				if selected := m.table.SelectedRow(); selected != nil {
-					username := selected[0]
-
-					hasPendingDevice := false
-					for _, u := range m.rawUsers {
-						if u[0] == username && len(u) > 4 {
-							hasPendingDevice = u[4] == "Yes"
-							break
-						}
-					}
-
-					if hasPendingDevice {
-						m.db.ApproveNewDevice(username)
-					} else {
-						m.db.ToggleApproval(username)
-					}
-					m.refreshTable()
-				}
-				return m, nil
-			case "P", "p":
-				if selected := m.table.SelectedRow(); selected != nil {
-					m.db.PromoteAdmin(selected[0])
-					m.refreshTable()
-				}
-				return m, nil
-			case "D", "d":
-				if selected := m.table.SelectedRow(); selected != nil {
-					m.db.DemoteAdmin(selected[0])
-					m.refreshTable()
+			if msg.String() == "tab" || msg.String() == "shift+tab" {
+				if m.focusPane == 0 {
+					m.focusPane = 1
+					m.table.Blur()
+				} else {
+					m.focusPane = 0
+					m.table.Focus()
 				}
 				return m, nil
 			}
+
+			if m.focusPane == 0 {
+				switch msg.String() {
+				case "A", "a":
+					if selected := m.table.SelectedRow(); selected != nil {
+						username := selected[0]
+						status := selected[2]
+
+						if status == "* Pending" {
+							m.db.ApproveRequest(username)
+						} else {
+							m.db.ToggleApproval(username)
+						}
+						m.refreshTable()
+					}
+					return m, nil
+				case "P", "p":
+					if selected := m.table.SelectedRow(); selected != nil {
+						m.db.PromoteAdmin(selected[0])
+						m.refreshTable()
+					}
+					return m, nil
+				case "D", "d":
+					if selected := m.table.SelectedRow(); selected != nil {
+						m.db.DemoteAdmin(selected[0])
+						m.refreshTable()
+					}
+					return m, nil
+				}
+			}
+
 		} else if !m.isAuthenticated {
 			switch msg.String() {
 			case "tab", "shift+tab", "up", "down":
@@ -235,8 +267,19 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *tuiModel) View() tea.View {
 	if m.isAdmin {
-		footer := "\n\nPress A to toggle approval • P to promote • D to demote • esc to quit"
-		v := tea.NewView(baseStyle.Render(m.table.View() + footer))
+		tableStyle := focusedStyle
+		appStyle := blurredStyle
+		if m.focusPane == 1 {
+			tableStyle = blurredStyle
+			appStyle = focusedStyle
+		}
+
+		footer := "\n\n[A] Approve/Revoke • [P] Promote • [D] Demote • [Tab] Switch Focus • [Esc] Quit"
+		tableSection := tableStyle.Render(m.table.View() + footer)
+
+		appSection := appStyle.Render("Welcome to Central Chatter!\n\nStandard user view is under construction.\n\nPress [Esc] to quit.")
+
+		v := tea.NewView(lipgloss.JoinVertical(lipgloss.Left, tableSection, appSection))
 		v.AltScreen = true
 		return v
 	}

@@ -68,8 +68,15 @@ func ServeWish(db *storage.Storage) {
 func TerminalGateway(db *storage.Storage) wish.Middleware {
 	return bubbletea.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 		username := s.User()
-		pubKey := s.PublicKey()
 
+		db.SetOnlineStatus(username, true)
+
+		go func() {
+			<-s.Context().Done()
+			db.SetOnlineStatus(username, false)
+		}()
+
+		pubKey := s.PublicKey()
 		isAuthenticated := false
 		if pubKey != nil {
 			isAuthenticated = db.ValidatePublicKey(username, pubKey)
@@ -77,6 +84,7 @@ func TerminalGateway(db *storage.Storage) wish.Middleware {
 
 		remote := s.RemoteAddr().String()
 		isLocalhost := strings.HasPrefix(remote, "127.0.0.1") || strings.HasPrefix(remote, "[::1]")
+
 		isAdmin := isLocalhost || (isAuthenticated && db.IsAdmin(username))
 
 		m := tui.InitialModel(db, isAdmin, isAuthenticated, pubKey, username)
