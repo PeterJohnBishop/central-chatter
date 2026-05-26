@@ -29,17 +29,17 @@ func ServeWish(db *storage.Storage) {
 	s, err := wish.NewServer(
 		wish.WithAddress(fmt.Sprintf("%s:%s", host, port)),
 		wish.WithHostKeyPath(".ssh/id_ed25519"),
-
+		// accepts all connection request
 		wish.WithPublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
 			return true
 		}),
 		wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
-			return true // Accepts all passwords for guests
+			return true
 		}),
 
 		wish.WithMiddleware(
 			logging.Middleware(),
-			myCustomApp(db),
+			TerminalGateway(db),
 		),
 	)
 	if err != nil {
@@ -65,7 +65,7 @@ func ServeWish(db *storage.Storage) {
 	}
 }
 
-func myCustomApp(db *storage.Storage) wish.Middleware {
+func TerminalGateway(db *storage.Storage) wish.Middleware {
 	return bubbletea.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 		username := s.User()
 		pubKey := s.PublicKey()
