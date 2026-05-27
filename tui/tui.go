@@ -240,7 +240,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				err := m.db.SubmitRequest(username, pubKeyStr, msgTxt)
 				if err != nil {
 					m.err = err
-					m.message = ""
+					m.message = err.Error()
 				} else {
 					m.message = "Request submitted successfully. Waiting for admin approval."
 					m.err = nil
