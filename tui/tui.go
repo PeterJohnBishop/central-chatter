@@ -6,6 +6,7 @@ import (
 
 	"charm.land/bubbles/v2/table"
 	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/peterjohnbishop/centra-chatter/storage"
@@ -21,10 +22,14 @@ var (
 	focusedStyle = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("62")).Padding(0, 1)
 )
 
+const chatBanner = `▄▄▄▄▄▄ ▄▄▄▄▄ ▄▄▄▄  ▄▄   ▄▄ ▄▄ ▄▄  ▄▄  ▄▄▄  ▄▄       ▄▄▄▄ ▄▄ ▄▄  ▄▄▄ ▄▄▄▄▄▄ ▄▄▄▄▄▄ ▄▄▄▄▄ ▄▄▄▄  
+ ██   ██▄▄  ██▄█▄ ██▀▄▀██ ██ ███▄██ ██▀██ ██  ▄▄▄ ██▀▀▀ ██▄██ ██▀██  ██     ██   ██▄▄  ██▄█▄ 
+ ██   ██▄▄▄ ██ ██ ██  ██ ██ ██ ▀██ ██▀██ ██▄▄▄   ▀████ ██ ██ ██▀██  ██     ██   ██▄▄▄ ██ ██`
+
 type tickMsg time.Time
 
 func doTick() tea.Cmd {
-	return tea.Tick(time.Second*5, func(t time.Time) tea.Msg {
+	return tea.Tick(time.Second*1, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
@@ -40,10 +45,28 @@ type tuiModel struct {
 	focus           int
 	focusPane       int // 0 = Admin Table, 1 = App View
 	message         string
+	viewport        viewport.Model
+	textInput       textinput.Model
+	messages        []string
 	err             error
 }
 
 func InitialModel(db *storage.Storage, isAdmin bool, isAuthenticated bool, pubKey ssh.PublicKey, username string) *tuiModel {
+
+	ti := textinput.New()
+	ti.SetWidth(50)
+	ti.Placeholder = "Type a message..."
+	ti.CharLimit = 256
+	if !isAdmin {
+		ti.Focus()
+	}
+
+	vp := viewport.New(
+		viewport.WithWidth(50),
+		viewport.WithHeight(10),
+	)
+	vp.SetContent("Welcome to Central Chatter!\n")
+
 	m := &tuiModel{
 		db:              db,
 		isAdmin:         isAdmin,
@@ -51,6 +74,9 @@ func InitialModel(db *storage.Storage, isAdmin bool, isAuthenticated bool, pubKe
 		username:        username,
 		publicKey:       pubKey,
 		focusPane:       0,
+		textInput:       ti,
+		viewport:        vp,
+		messages:        []string{"System: Welcome to Central Chatter!"},
 	}
 
 	if isAdmin {
@@ -138,39 +164,86 @@ func (m *tuiModel) Init() tea.Cmd {
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
+	if m.isAdmin && m.focusPane == 1 {
+		var cmd tea.Cmd
+		m.textInput, cmd = m.textInput.Update(msg)
+		cmds = append(cmds, cmd)
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+	} else if m.isAuthenticated && !m.isAdmin {
+		var cmd tea.Cmd
+		m.textInput, cmd = m.textInput.Update(msg)
+		cmds = append(cmds, cmd)
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+	} else if !m.isAuthenticated {
+		for i := range m.inputs {
+			var cmd tea.Cmd
+			m.inputs[i], cmd = m.inputs[i].Update(msg)
+			cmds = append(cmds, cmd)
+		}
+	}
+
+	if m.isAdmin {
+		var cmd tea.Cmd
+		m.table, cmd = m.table.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+
 	switch msg := msg.(type) {
 	case tickMsg:
 		if m.isAdmin {
 			m.refreshTable()
-			cmds = append(cmds, doTick())
-		} else if !m.isAuthenticated && m.publicKey != nil {
+		}
+
+		if !m.isAuthenticated && m.publicKey != nil {
 			if m.db.ValidatePublicKey(m.username, m.publicKey) {
 				m.isAuthenticated = true
 			}
-			cmds = append(cmds, doTick())
 		}
+
+		if m.isAuthenticated || m.isAdmin {
+			recentMessages, err := m.db.GetRecentMessages(100)
+			if err == nil {
+				if len(recentMessages) != len(m.messages) {
+					m.messages = recentMessages
+					m.viewport.SetContent(m.formatMessages())
+					m.viewport.GotoBottom()
+				}
+			}
+		}
+
+		cmds = append(cmds, doTick())
 
 	case tea.WindowSizeMsg:
+		chatWidth := msg.Width - 4
 		if m.isAdmin {
-			m.table.SetWidth(msg.Width - 4)
+			m.table.SetWidth(chatWidth)
+			m.viewport.SetHeight(msg.Height - 24)
+		} else {
+			m.viewport.SetHeight(msg.Height - 10)
 		}
+		m.viewport.SetWidth(chatWidth)
+		m.textInput.SetWidth(chatWidth - 4)
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			return m, tea.Quit
 		}
-
 		if m.isAdmin {
+
 			if msg.String() == "tab" || msg.String() == "shift+tab" {
 				if m.focusPane == 0 {
 					m.focusPane = 1
 					m.table.Blur()
+					m.textInput.Focus()
 				} else {
 					m.focusPane = 0
 					m.table.Focus()
+					m.textInput.Blur()
 				}
-				return m, nil
+				return m, tea.Batch(cmds...)
 			}
 
 			if m.focusPane == 0 {
@@ -200,10 +273,37 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.refreshTable()
 					}
 					return m, nil
+				case "X", "x":
+					if selected := m.table.SelectedRow(); selected != nil {
+						m.db.DeleteUser(selected[0])
+						m.refreshTable()
+					}
+					return m, nil
 				}
 			}
+		}
 
-		} else if !m.isAuthenticated {
+		isChatActive := (m.isAuthenticated && !m.isAdmin) || (m.isAdmin && m.focusPane == 1)
+
+		if isChatActive {
+			if msg.String() == "enter" && m.textInput.Value() != "" {
+				msgText := m.textInput.Value()
+				m.textInput.Reset()
+
+				// Save to SQLite database
+				m.db.SaveMessage(m.username, msgText)
+
+				// Force an immediate refresh
+				recentMessages, err := m.db.GetRecentMessages(100)
+				if err == nil {
+					m.messages = recentMessages
+					m.viewport.SetContent(m.formatMessages())
+					m.viewport.GotoBottom()
+				}
+			}
+		}
+
+		if !m.isAuthenticated && !m.isAdmin {
 			switch msg.String() {
 			case "tab", "shift+tab", "up", "down":
 				s := msg.String()
@@ -250,19 +350,69 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if m.isAdmin {
-		var cmd tea.Cmd
-		m.table, cmd = m.table.Update(msg)
-		cmds = append(cmds, cmd)
-	} else if !m.isAuthenticated {
-		for i := range m.inputs {
-			var cmd tea.Cmd
-			m.inputs[i], cmd = m.inputs[i].Update(msg)
-			cmds = append(cmds, cmd)
+	return m, tea.Batch(cmds...)
+}
+
+func (m *tuiModel) formatMessages() string {
+	var b strings.Builder
+
+	chatWidth := m.viewport.Width()
+	if chatWidth > 2 {
+		chatWidth -= 2
+	}
+
+	localStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Align(lipgloss.Right).Width(chatWidth)
+	remoteStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("99")).Align(lipgloss.Left).Width(chatWidth)
+	systemStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Align(lipgloss.Center).Width(chatWidth)
+	deletedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Align(lipgloss.Left).Width(chatWidth)
+
+	localPrefix := m.username + ":"
+
+	for _, msg := range m.messages {
+		if strings.HasPrefix(msg, localPrefix) {
+			b.WriteString(localStyle.Render(msg))
+			b.WriteString("\n")
+		} else if strings.HasPrefix(msg, "System:") {
+			b.WriteString(systemStyle.Render(msg))
+			b.WriteString("\n")
+		} else if strings.HasPrefix(msg, "DELETED:") {
+			b.WriteString(deletedStyle.Render(msg))
+			b.WriteString("\n")
+		} else {
+			b.WriteString(remoteStyle.Render(msg))
+			b.WriteString("\n")
 		}
 	}
 
-	return m, tea.Batch(cmds...)
+	rendered := b.String()
+
+	rendered = strings.TrimSuffix(rendered, "\n")
+
+	contentHeight := lipgloss.Height(rendered)
+	vpHeight := m.viewport.Height()
+
+	if contentHeight < vpHeight {
+		padding := strings.Repeat("\n", vpHeight-contentHeight)
+		rendered = padding + rendered
+	}
+
+	return rendered
+}
+
+// Helper to quickly render the messaging stack
+func (m *tuiModel) chatView() string {
+	bannerStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("62")).
+		Align(lipgloss.Center).
+		Width(m.viewport.Width()).
+		MarginBottom(1)
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		bannerStyle.Render(chatBanner),
+		m.viewport.View(),
+		lipgloss.NewStyle().MarginTop(1).Render(m.textInput.View()),
+	)
 }
 
 func (m *tuiModel) View() tea.View {
@@ -274,10 +424,11 @@ func (m *tuiModel) View() tea.View {
 			appStyle = focusedStyle
 		}
 
-		footer := "\n\n[A] Approve/Revoke • [P] Promote • [D] Demote • [Tab] Switch Focus • [Esc] Quit"
+		footer := "\n\n[A] Approve/Revoke • [P] Promote • [D] Demote • [X] Delete • [Tab] Switch Focus • [Esc] Quit"
 		tableSection := tableStyle.Render(m.table.View() + footer)
 
-		appSection := appStyle.Render("Welcome to Central Chatter!\n\nStandard user view is under construction.\n\nPress [Esc] to quit.")
+		// Inject the new dynamic chat UI
+		appSection := appStyle.Render(m.chatView())
 
 		v := tea.NewView(lipgloss.JoinVertical(lipgloss.Left, tableSection, appSection))
 		v.AltScreen = true
@@ -285,7 +436,7 @@ func (m *tuiModel) View() tea.View {
 	}
 
 	if m.isAuthenticated {
-		v := tea.NewView(baseStyle.Render("Welcome to Central Chatter!\n\nStandard user view is under construction.\n\nPress [Esc] to quit."))
+		v := tea.NewView(baseStyle.Render(m.chatView()))
 		v.AltScreen = true
 		return v
 	}

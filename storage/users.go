@@ -1,6 +1,9 @@
 package storage
 
-import "fmt"
+import (
+	"database/sql"
+	"fmt"
+)
 
 // list all users
 func (s *Storage) GetAllUsers() ([][]string, error) {
@@ -11,6 +14,7 @@ func (s *Storage) GetAllUsers() ([][]string, error) {
 			CAST(is_approved AS TEXT),
 			COALESCE(role, 'user')
 		FROM users
+		WHERE username != 'DELETED'
 		ORDER BY username ASC
 	`
 	rows, err := s.db.Query(query)
@@ -84,4 +88,41 @@ func (s *Storage) SetOnlineStatus(username string, isOnline bool) error {
 	}
 	_, err := s.db.Exec(`UPDATE users SET is_active = ? WHERE username = ?`, status, username)
 	return err
+}
+
+// delete user
+func (s *Storage) DeleteUser(username string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var deletedUserID string
+	err = tx.QueryRow(`SELECT id FROM users WHERE username = 'DELETED'`).Scan(&deletedUserID)
+	if err == sql.ErrNoRows {
+		deletedUserID, _ = GenerateUUIDv4()
+		_, err = tx.Exec(`INSERT INTO users (id, username, is_active, is_approved) VALUES (?, 'DELETED', 0, 0)`, deletedUserID)
+		if err != nil {
+			return fmt.Errorf("failed to create tombstone user: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("database error: %w", err)
+	}
+
+	var targetUserID string
+	err = tx.QueryRow(`SELECT id FROM users WHERE username = ?`, username).Scan(&targetUserID)
+	if err != nil {
+		return fmt.Errorf("user not found: %w", err)
+	}
+
+	if _, err = tx.Exec(`UPDATE content SET user_id = ? WHERE user_id = ?`, deletedUserID, targetUserID); err != nil {
+		return fmt.Errorf("failed to reassign messages: %w", err)
+	}
+
+	if _, err = tx.Exec(`DELETE FROM users WHERE id = ?`, targetUserID); err != nil {
+		return fmt.Errorf("failed to delete user: %w", err)
+	}
+
+	return tx.Commit()
 }

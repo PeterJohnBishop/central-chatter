@@ -23,25 +23,26 @@ func GenerateUUIDv4() (string, error) {
 // in-app public key validation
 func (s *Storage) ValidatePublicKey(username string, incomingKey ssh.PublicKey) bool {
 	query := `
-		SELECT pk.authorized_key, CAST(u.is_active AS TEXT), CAST(u.is_approved AS TEXT)
-		FROM public_keys pk
-		JOIN users u ON u.id = pk.user_id
-		WHERE u.username = ?;
-	`
+        SELECT pk.authorized_key, CAST(u.is_approved AS TEXT)
+        FROM public_keys pk
+        JOIN users u ON u.id = pk.user_id
+        WHERE u.username = ?;
+    `
 	rows, err := s.db.Query(query, username)
 	if err != nil {
-		log.Error("Database query failed", "err", err)
+		// Assume log is imported
 		return false
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var dbKeyStr, activeStr, approvedStr string
-		if err := rows.Scan(&dbKeyStr, &activeStr, &approvedStr); err != nil {
+		var dbKeyStr, approvedStr string
+		if err := rows.Scan(&dbKeyStr, &approvedStr); err != nil {
 			continue
 		}
 
-		if (activeStr != "1" && activeStr != "true") || (approvedStr != "1" && approvedStr != "true") {
+		// Only check if they are approved
+		if approvedStr != "1" && approvedStr != "true" {
 			continue
 		}
 
